@@ -1,151 +1,117 @@
 # poly-predict
 
-A **paper-tracking** signal scanner for Polymarket: **pure Python standard library, single file, virtual money only — it never places orders and holds no keys.** It models fair probabilities for two market families, compares them with live prices, and logs the gaps as paper signals with disciplined, cheap-side-only rules.
+I kept seeing Polymarket prices that looked wrong, so I built this to check whether my idea of "wrong" actually finds an edge or just feels like one. It models fair probabilities for two market families, compares them with the live book, and logs the gaps as paper signals. Virtual money only — it never places an order and holds no keys. Stdlib only, one main file.
 
 ## What it models
 
-**Crypto price markets** (BTC / ETH / SOL / XRP: daily "above" markets and monthly "reach/dip" markets)
-- Zero-drift GBM probabilities: terminal (digital) and first-passage (barrier) formulas
-- Volatility from Binance realized vol — hourly blend for short horizons, daily for longer ones
+Crypto price markets (BTC / ETH / SOL / XRP: daily "above" markets, monthly "reach / dip" markets). Zero-drift GBM, with the terminal formula for digitals and the first-passage formula for barriers. Volatility is Binance realized vol — an hourly blend for short horizons, daily for longer ones.
 
-**Weather markets** (daily highest/lowest temperature buckets for 14 cities)
-- Probabilities counted from the Open-Meteo GFS ensemble (31 members), with a calibration shrink applied (floor 0.02 / cap 0.90)
+Weather markets (daily high/low temperature buckets for 14 cities). Probabilities are counted from the Open-Meteo GFS ensemble (31 members), then shrunk a bit for calibration: floor 0.02, cap 0.90. Ensemble counts get overconfident at the tails, hence the shrink.
 
-## Signal discipline
+Sports and politics are not covered. I don't have a free probability source for them that I'd trust, and a bad model is worse than no model.
 
-Execution prices are **not** the displayed mid: the scanner walks the real CLOB order book and uses the VWAP for the intended stake. A candidate becomes a formal paper signal only when all gates pass:
+## The discipline (this is the actual point of the project)
 
-- executable edge ≥ 8 pp after the order book
-- cost within the configured cap, and order-book spread ≤ 0.05
-- model win probability of the chosen side ≥ 25 % (no lottery tickets, however cheap)
+The price on the market page is a mid, and you can't buy a mid. The scanner walks the real CLOB order book and computes the VWAP for the intended stake. A candidate becomes a formal signal only if all of these hold:
+
+- executable edge ≥ 8 pp after walking the book
+- cost ≤ 0.5 — cheap side only, no paying up for "sure things"
+- order-book spread ≤ 0.05
+- model win probability of the chosen side ≥ 25 % — no lottery tickets, however cheap they look
 - stake = quarter-Kelly, capped at 5 % of equity per signal and 10 % per asset/expiry group, minimum $5
 
-Near-misses (edge ≥ 5 pp, cost ≤ 0.45, win probability ≥ 30 %) go to a **watchlist** instead — tracked, but excluded from the formal track record. Settlements are resolved against the official market outcome after expiry; running stats include count, win rate, paper P&L, ROI and Brier score. A daily summary can be pushed to Telegram (`daily` command); scans themselves only log locally.
+Near-misses (edge ≥ 5 pp, cost ≤ 0.45, win probability ≥ 30 %) go to a watchlist instead: tracked and settled, but kept out of the formal record. After expiry, signals settle against the official outcome; running stats are count, win rate, paper P&L, ROI and Brier score.
 
-`promote_watchlist.py` is a small maintenance helper: it promotes watchlist entries that meet the formal bar into the signaled set, and prints an alert list of signaled entries whose cost exceeded 0.5.
+An honest bug from the first week: an early version had the cost gate mis-wired, and five weather positions got logged at costs of 0.52–0.59 — above the 0.5 cap that's the whole point of the strategy. I fixed the gate and scored those five separately instead of quietly folding them into the record. The first signal that passed every gate properly was an ETH monthly "reach $2,400" NO at about 0.44.
 
-## Deployment
+`promote_watchlist.py` is a small helper: it promotes watchlist entries that now meet the formal bar, and prints any formal signals whose cost exceeded 0.5 (which is how the bug above got caught).
 
-1. **Configure (optional)**: `cp config.example.json config.json`. Defaults (in the example file) are used for anything unset. For the Telegram daily report, store your bot token in its own file and set `telegram.bot_token_file` + `telegram.chat_id`.
-2. **Run**:
+## Running it
 
-   ```bash
-   python3 predict.py          # one scan: discover, score, settle, log
-   python3 predict.py daily    # send the daily P&L summary via Telegram
-   ```
+```bash
+cp config.example.json config.json   # optional; anything unset uses the defaults
+python3 predict.py                    # one scan: discover, score, settle, log
+python3 predict.py daily              # Telegram summary of the running record
+```
 
-   Typical cron setup:
+My cron looks like:
 
-   ```cron
-   0 9,21 * * *  cd /opt/poly-predict && /usr/bin/python3 predict.py >> scan.log 2>&1
-   0 16 * * *    cd /opt/poly-predict && /usr/bin/python3 predict.py daily >> scan.log 2>&1
-   ```
+```cron
+0 9,21 * * *  cd /opt/poly-predict && /usr/bin/python3 predict.py >> scan.log 2>&1
+0 16 * * *    cd /opt/poly-predict && /usr/bin/python3 predict.py daily >> scan.log 2>&1
+```
 
-State lives in `state.json`; formal signals are appended to `ledger.jsonl`, watchlist entries to `watch-ledger.jsonl` — all next to the script.
+State is `state.json`; formal signals append to `ledger.jsonl`, watchlist entries to `watch-ledger.jsonl`, all next to the script. The Telegram summary needs a bot token in its own file plus a chat ID in config; the scans themselves only write local files.
 
-## Configuration (config.json)
+## Config
 
-| Key | Description |
+| Key | What it does |
 | --- | --- |
-| `telegram.bot_token_file` / `telegram.chat_id` | Token file path and target chat for the daily report. Empty = no push. The token never goes into config or code. |
-| `edge_min` | Minimum executable edge for a formal signal (default 0.08 = 8 pp). |
-| `cheap_max` | Maximum execution cost for a formal signal. |
-| `min_winp` | Minimum model win probability of the chosen side (default 0.25). |
-| `watch_edge_min` / `watch_cheap_max` / `watch_min_winp` | Watchlist gates (defaults 0.05 / 0.45 / 0.30). |
-| `max_spread` | Maximum allowed order-book spread (default 0.05). |
-| `bankroll` | Virtual bankroll (default $1,000). |
-| `kelly_fraction` | Kelly multiplier for staking (default 0.25 = quarter-Kelly). |
-| `max_single_fraction` / `max_group_fraction` | Equity caps per signal / per asset+expiry group (defaults 5 % / 10 %). |
-| `min_stake` | Minimum stake for a formal signal (default $5). |
-| `assets` | Map of Polymarket asset names → Binance symbols for the crypto model. |
+| `edge_min` | Min executable edge for a formal signal (0.08) |
+| `cheap_max` | Max execution cost for a formal signal (0.5) |
+| `min_winp` | Min model win probability of the chosen side (0.25) |
+| `watch_edge_min` / `watch_cheap_max` / `watch_min_winp` | Watchlist gates (0.05 / 0.45 / 0.30) |
+| `max_spread` | Max allowed book spread (0.05) |
+| `bankroll` | Virtual bankroll (1000) |
+| `kelly_fraction` | Kelly multiplier (0.25) |
+| `max_single_fraction` / `max_group_fraction` | Equity caps per signal / per group (5 % / 10 %) |
+| `min_stake` | Minimum formal stake ($5) |
+| `assets` | Polymarket asset name → Binance symbol map |
+| `telegram.*` | Optional daily summary push |
 
-## Notes & disclaimer
+Paper results flatter reality: no queue position, no partial fills, no withdrawal costs, and markets can be suspended. A model that's right on average still loses plenty of individual bets. The weather side also depends on Polymarket keeping its market naming conventions and Open-Meteo keeping its API — both have broken before. Research tool, not financial advice. Report texts are Chinese literals.
 
-- This is a **research/validation tool**, not financial advice. Prediction-market paper results ignore real-world frictions (queue position, partial fills, withdrawal costs, market suspensions) and a model being "right" on average still loses plenty of individual bets.
-- The weather model depends on Open-Meteo's ensemble API and on Polymarket's market naming conventions; the crypto model depends on the public Gamma/CLOB APIs and Binance spot data. Any of these can change without notice.
-- Report texts are in Chinese; they are plain string literals and can be replaced freely.
-
-## Custom development
-
-Thresholds, asset lists, cities and models are all adjustable. If you need a variant (other market families, alert channels, reporting), a customized or hosted version can be arranged — contact the author.
-
-## License
-
-MIT, see [LICENSE](LICENSE).
+MIT license, see LICENSE.
 
 ---
 
 ## 中文版
 
-一个 Polymarket **纸面信号**扫描器：**纯 Python 标准库、单文件、只有虚拟资金——从不下单、不持有任何密钥。**它给两类市场建模算「公允概率」，与实时价格对比，把差价按严格的「只买便宜边」纪律记成纸面信号。
+总在 Polymarket 上看到觉得「定价不对」的盘，就写了这个来验证：我的「不对」到底是真有差价，还是只是感觉。它给两类市场建模算公允概率，跟实时盘口比，把差价按一套纪律记成纸面信号。只有虚拟资金，从不下单、不持有密钥。纯标准库，一个主文件。
 
-### 模型覆盖
+### 模型
 
-**币价类市场**（BTC / ETH / SOL / XRP：每日 Above 盘、月度 Reach/Dip 盘）
-- 零漂移 GBM 概率：到期型（数字期权式）与首达型（障碍式）两个公式
-- 波动率取 Binance 已实现波动率——短周期用小时级混合、长周期用日级
+币价类（BTC / ETH / SOL / XRP：每日 Above 盘、月度 Reach/Dip 盘）：零漂移 GBM，到期型用数字期权公式、首达型用障碍公式。波动率取 Binance 已实现波动率，短周期用小时级混合、长周期用日级。
 
-**天气类市场**（14 个城市每日最高/最低温分桶盘）
-- 概率用 Open-Meteo 的 GFS 集合预报（31 个成员）数成员占比，再做校准收缩（下限 0.02 / 上限 0.90）
+天气类（14 个城市的每日最高/最低温分桶盘）：概率用 Open-Meteo 的 GFS 集合预报（31 个成员）数占比，再做一次校准收缩，下限 0.02、上限 0.90——集合计数在尾部容易过度自信，不缩不行。
 
-### 信号纪律
+体育和政治没接：没有我信得过的免费概率源，烂模型比没模型更坑。
 
-执行价**不是**页面显示的中间价：扫描器会走真实 CLOB 订单簿，按目标金额算 VWAP。候选要成为正式纸面信号，必须同时过闸：
+### 纪律（这个项目真正的重点）
+
+页面上显示的是中间价，而中间价是买不到的。扫描器会走真实 CLOB 订单簿，按目标金额算 VWAP。候选要成为正式信号，必须同时满足：
 
 - 走完订单簿后的可执行差价 ≥ 8 pp
-- 成本在配置上限内，且订单簿价差 ≤ 0.05
-- 所选边的模型胜率 ≥ 25 %（再便宜的彩票型也不做）
+- 成本 ≤ 0.5，只买便宜边，不为「稳赢」付高价
+- 订单簿价差 ≤ 0.05
+- 所选边的模型胜率 ≥ 25 %，再便宜的彩票型也不做
 - 仓位 = 四分之一凯利，单条 ≤ 净值 5 %、同资产同到期一组 ≤ 10 %，最小 $5
 
-差一点的（差价 ≥ 5 pp、成本 ≤ 0.45、胜率 ≥ 30 %）进**观察名单**——只跟踪、不计正式战绩。到期后按官方结果结算；累计统计含笔数、胜率、纸面盈亏、ROI 和 Brier 分数。每日汇总可经 Telegram 推送（`daily` 命令）；扫描本身只写本地日志。
+差一点的（差价 ≥ 5 pp、成本 ≤ 0.45、胜率 ≥ 30 %）进观察名单：照样跟踪结算，但不计正式战绩。到期按官方结果结算，累计统计有笔数、胜率、纸面盈亏、ROI 和 Brier 分数。
 
-`promote_watchlist.py` 是个小维护工具：把达到正式门槛的观察名单条目晋升进正式信号集，并打印已正式信号中成本超过 0.5 的报警清单。
+说个第一周的真事：早期版本成本闸门接错了，五笔天气单以 0.52–0.59 的成本记了账——而 0.5 上限正是这套策略的命根子。发现后我把闸门改对，那五笔单独计分，没混进正式战绩里。第一个完全合规过闸的信号是 ETH 月度「摸 $2,400」买 NO，成本约 0.44。
 
-### 部署三步
+`promote_watchlist.py` 是个小工具：把达到正式门槛的观察名单条目晋升，并打印正式信号里成本超过 0.5 的报警清单（上面那个 bug 就是靠它发现的）。
 
-1. **填配置（可选）**：`cp config.example.json config.json`，没设的项用示例文件里的默认值。想推 Telegram 日报：把 bot token 单独存一个文件，填 `telegram.bot_token_file` 和 `telegram.chat_id`。
-2. **运行**：
+### 跑法
 
-   ```bash
-   python3 predict.py          # 跑一次扫描：发现、打分、结算、记账
-   python3 predict.py daily    # 经 Telegram 发每日盈亏汇总
-   ```
+```bash
+cp config.example.json config.json   # 可选，没设的项用默认值
+python3 predict.py                    # 跑一次：发现、打分、结算、记账
+python3 predict.py daily              # 经 Telegram 发战绩汇总
+```
 
-   典型 cron：
+我的 cron 是早晚各扫一次、下午发日报：
 
-   ```cron
-   0 9,21 * * *  cd /opt/poly-predict && /usr/bin/python3 predict.py >> scan.log 2>&1
-   0 16 * * *    cd /opt/poly-predict && /usr/bin/python3 predict.py daily >> scan.log 2>&1
-   ```
+```cron
+0 9,21 * * *  cd /opt/poly-predict && /usr/bin/python3 predict.py >> scan.log 2>&1
+0 16 * * *    cd /opt/poly-predict && /usr/bin/python3 predict.py daily >> scan.log 2>&1
+```
 
-状态在 `state.json`；正式信号追加到 `ledger.jsonl`，观察名单追加到 `watch-ledger.jsonl`，都在脚本同目录。
+状态在 `state.json`，正式信号追加到 `ledger.jsonl`，观察名单到 `watch-ledger.jsonl`，都在脚本同目录。日报推送需要把 bot token 单独存文件、config 里填 chat ID；扫描本身只写本地文件。
 
-### 配置项说明（config.json）
+配置键：`edge_min` 正式信号最低差价（0.08）、`cheap_max` 最高成本（0.5）、`min_winp` 最低胜率（0.25）、`watch_*` 三个观察名单闸门（0.05/0.45/0.30）、`max_spread` 最大盘口价差（0.05）、`bankroll` 虚拟本金（1000）、`kelly_fraction` 凯利倍数（0.25）、`max_single_fraction`/`max_group_fraction` 仓位上限（5%/10%）、`min_stake` 最小下注（$5）、`assets` 资产映射、`telegram.*` 日报推送。全集看示例文件。
 
-| 键 | 说明 |
-| --- | --- |
-| `telegram.bot_token_file` / `telegram.chat_id` | 日报用的 token 文件路径和目标 chat。留空 = 不推送。token 不写进 config、更不写进代码。 |
-| `edge_min` | 正式信号的最低可执行差价（默认 0.08 = 8 pp）。 |
-| `cheap_max` | 正式信号的最高执行成本。 |
-| `min_winp` | 所选边的最低模型胜率（默认 0.25）。 |
-| `watch_edge_min` / `watch_cheap_max` / `watch_min_winp` | 观察名单闸门（默认 0.05 / 0.45 / 0.30）。 |
-| `max_spread` | 允许的最大订单簿价差（默认 0.05）。 |
-| `bankroll` | 虚拟本金（默认 $1,000）。 |
-| `kelly_fraction` | 定仓的凯利倍数（默认 0.25 = 四分之一凯利）。 |
-| `max_single_fraction` / `max_group_fraction` | 单条 / 同组仓位占净值上限（默认 5 % / 10 %）。 |
-| `min_stake` | 正式信号的最小下注额（默认 $5）。 |
-| `assets` | Polymarket 资产名 → Binance 币种符号的映射（币价模型用）。 |
+纸面成绩必然比实盘好看：没有排队位置、没有部分成交、没有提现成本，盘还可能被暂停；模型平均而言是对的，照样输掉很多单笔。天气那边还依赖 Polymarket 不改市场命名、Open-Meteo 不改接口——两边都抽过风。研究工具，不是投资建议。报告文案是中文字符串。
 
-### 说明与免责
-
-- 这是**研究/验证工具**，不是投资建议。预测市场的纸面成绩忽略了真实摩擦（排队位置、部分成交、提现成本、市场暂停），而且模型「平均而言是对的」也照样会输掉很多单笔。
-- 天气模型依赖 Open-Meteo 集合预报接口和 Polymarket 的市场命名规则；币价模型依赖公开的 Gamma/CLOB 接口和 Binance 现货数据。任何一方都可能随时变更。
-- 报告文案为中文，都是普通字符串，可自行替换。
-
-### 定制开发
-
-阈值、资产表、城市表、模型都能自己改。如果需要变体（其他市场类别、告警通道、报表），需要定制版或代部署，可联系作者获取付费定制服务。
-
-### License
-
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 LICENSE。
